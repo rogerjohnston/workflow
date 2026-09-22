@@ -136,40 +136,99 @@ final class HealthCheck
         $lineage = is_array($projections['run_lineage_entries'] ?? null)
             ? $projections['run_lineage_entries']
             : [];
-        $waitNeedsRebuild = self::integer($waits['needs_rebuild'] ?? 0);
-        $timelineNeedsRebuild = self::integer($timeline['needs_rebuild'] ?? 0);
-        $timerNeedsRebuild = self::integer($timers['needs_rebuild'] ?? 0);
-        $lineageNeedsRebuild = self::integer($lineage['needs_rebuild'] ?? 0);
-        $needsRebuild = $waitNeedsRebuild + $timelineNeedsRebuild + $timerNeedsRebuild + $lineageNeedsRebuild;
+        $groups = [
+            'run_waits' => $waits,
+            'run_timeline_entries' => $timeline,
+            'run_timer_entries' => $timers,
+            'run_lineage_entries' => $lineage,
+        ];
+        $unevaluatedGroups = array_keys(array_filter(
+            $groups,
+            static fn (array $group): bool => ($group['evaluated'] ?? true) !== true,
+        ));
+        $evaluated = $unevaluatedGroups === [];
+        $reason = null;
+
+        if (! $evaluated) {
+            foreach ($groups as $group) {
+                if (($group['evaluated'] ?? true) === true || ! is_string($group['reason'] ?? null)) {
+                    continue;
+                }
+
+                $reason = $group['reason'];
+                break;
+            }
+
+            $reason ??= 'selected_run_projection_drift_unevaluated';
+        }
+
+        $waitNeedsRebuild = ($waits['evaluated'] ?? true) === true
+            ? self::integer($waits['needs_rebuild'] ?? 0)
+            : null;
+        $timelineNeedsRebuild = ($timeline['evaluated'] ?? true) === true
+            ? self::integer($timeline['needs_rebuild'] ?? 0)
+            : null;
+        $timerNeedsRebuild = ($timers['evaluated'] ?? true) === true
+            ? self::integer($timers['needs_rebuild'] ?? 0)
+            : null;
+        $lineageNeedsRebuild = ($lineage['evaluated'] ?? true) === true
+            ? self::integer($lineage['needs_rebuild'] ?? 0)
+            : null;
+        $needsRebuild = $evaluated
+            ? $waitNeedsRebuild + $timelineNeedsRebuild + $timerNeedsRebuild + $lineageNeedsRebuild
+            : null;
 
         return self::check(
             'selected_run_projections',
-            $needsRebuild === 0 ? 'ok' : 'warning',
-            $needsRebuild === 0
-                ? 'Selected-run wait, timeline, timer, and lineage projections are aligned with durable v2 detail.'
-                : 'Selected-run wait, timeline, timer, or lineage projections need rebuild before trusting Waterline detail.',
+            $evaluated && $needsRebuild === 0 ? 'ok' : 'warning',
+            match (true) {
+                ! $evaluated => 'Selected-run projection drift scans are disabled, so wait, timeline, timer, and lineage projection correctness is not evaluated.',
+                $needsRebuild === 0 => 'Selected-run wait, timeline, timer, and lineage projections are aligned with durable v2 detail.',
+                default => 'Selected-run wait, timeline, timer, or lineage projections need rebuild before trusting Waterline detail.',
+            },
             self::CATEGORY_CORRECTNESS,
             [
+                'evaluated' => $evaluated,
+                'reason' => $reason,
+                'unevaluated_groups' => $unevaluatedGroups,
                 'needs_rebuild' => $needsRebuild,
                 'run_waits_needs_rebuild' => $waitNeedsRebuild,
-                'run_waits_missing_runs_with_waits' => self::integer($waits['missing_runs_with_waits'] ?? 0),
+                'run_waits_missing_runs_with_waits' => ($waits['evaluated'] ?? true) === true
+                    ? self::integer($waits['missing_runs_with_waits'] ?? 0)
+                    : null,
                 'run_waits_missing_current_open_waits' => self::integer($waits['missing_current_open_waits'] ?? 0),
-                'run_waits_stale_projected_runs' => self::integer($waits['stale_projected_runs'] ?? 0),
+                'run_waits_stale_projected_runs' => ($waits['evaluated'] ?? true) === true
+                    ? self::integer($waits['stale_projected_runs'] ?? 0)
+                    : null,
                 'run_waits_orphaned' => self::integer($waits['orphaned'] ?? 0),
                 'timeline_needs_rebuild' => $timelineNeedsRebuild,
-                'timeline_missing_runs_with_history' => self::integer($timeline['missing_runs_with_history'] ?? 0),
+                'timeline_missing_runs_with_history' => ($timeline['evaluated'] ?? true) === true
+                    ? self::integer($timeline['missing_runs_with_history'] ?? 0)
+                    : null,
                 'timeline_missing_history_events' => self::integer($timeline['missing_history_events'] ?? 0),
-                'timeline_stale_projected_runs' => self::integer($timeline['stale_projected_runs'] ?? 0),
+                'timeline_stale_projected_runs' => ($timeline['evaluated'] ?? true) === true
+                    ? self::integer($timeline['stale_projected_runs'] ?? 0)
+                    : null,
                 'timeline_orphaned' => self::integer($timeline['orphaned'] ?? 0),
                 'timer_needs_rebuild' => $timerNeedsRebuild,
-                'timer_missing_runs_with_timers' => self::integer($timers['missing_runs_with_timers'] ?? 0),
-                'timer_stale_projected_runs' => self::integer($timers['stale_projected_runs'] ?? 0),
-                'timer_schema_version_mismatch_runs' => self::integer($timers['schema_version_mismatch_runs'] ?? 0),
+                'timer_missing_runs_with_timers' => ($timers['evaluated'] ?? true) === true
+                    ? self::integer($timers['missing_runs_with_timers'] ?? 0)
+                    : null,
+                'timer_stale_projected_runs' => ($timers['evaluated'] ?? true) === true
+                    ? self::integer($timers['stale_projected_runs'] ?? 0)
+                    : null,
+                'timer_schema_version_mismatch_runs' => ($timers['evaluated'] ?? true) === true
+                    ? self::integer($timers['schema_version_mismatch_runs'] ?? 0)
+                    : null,
                 'timer_schema_version_mismatch_rows' => self::integer($timers['schema_version_mismatch_rows'] ?? 0),
                 'timer_orphaned' => self::integer($timers['orphaned'] ?? 0),
                 'lineage_needs_rebuild' => $lineageNeedsRebuild,
-                'lineage_missing_runs_with_lineage' => self::integer($lineage['missing_runs_with_lineage'] ?? 0),
-                'lineage_stale_projected_runs' => self::integer($lineage['stale_projected_runs'] ?? 0),
+                'lineage_missing_runs_with_lineage' => ($lineage['evaluated'] ?? true) === true
+                    ? self::integer($lineage['missing_runs_with_lineage'] ?? 0)
+                    : null,
+                'lineage_stale_projected_runs' => ($lineage['evaluated'] ?? true) === true
+                    ? self::integer($lineage['stale_projected_runs'] ?? 0)
+                    : null,
                 'lineage_orphaned' => self::integer($lineage['orphaned'] ?? 0),
             ],
         );

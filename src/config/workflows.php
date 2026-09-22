@@ -62,6 +62,12 @@ return [
         'run_lineage_entry_model' => Workflow\V2\Models\WorkflowRunLineageEntry::class,
         'schedule_model' => Workflow\V2\Models\WorkflowSchedule::class,
         'schedule_history_event_model' => Workflow\V2\Models\WorkflowScheduleHistoryEvent::class,
+        'observability' => [
+            // Selected-run projection drift checks compare full durable histories
+            // with their detail projections. Keep exact checks enabled unless a
+            // host application explicitly chooses bounded dashboard observation.
+            'selected_run_projection_drift_enabled' => true,
+        ],
         'service_endpoint_model' => Workflow\V2\Models\WorkflowServiceEndpoint::class,
         'service_model' => Workflow\V2\Models\WorkflowService::class,
         'service_operation_model' => Workflow\V2\Models\WorkflowServiceOperation::class,

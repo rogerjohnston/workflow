@@ -4,7 +4,9 @@ declare(strict_types=1);
 
 namespace Tests\Feature\V2;
 
+use Illuminate\Database\Events\QueryExecuted;
 use Illuminate\Support\Carbon;
+use Illuminate\Support\Facades\DB;
 use Tests\TestCase;
 use Workflow\V2\Enums\ActivityStatus;
 use Workflow\V2\Enums\CommandOutcome;
@@ -762,6 +764,11 @@ final class V2OperatorMetricsTest extends TestCase
 
         $snapshot = OperatorMetrics::snapshot();
 
+        foreach (['run_waits', 'run_timeline_entries', 'run_timer_entries', 'run_lineage_entries'] as $group) {
+            $this->assertTrue($snapshot['projections'][$group]['evaluated']);
+            $this->assertNull($snapshot['projections'][$group]['reason']);
+        }
+
         $this->assertSame(2, $snapshot['projections']['run_waits']['runs']);
         $this->assertSame(2, $snapshot['projections']['run_waits']['rows']);
         $this->assertSame(2, $snapshot['projections']['run_waits']['projected_runs']);
@@ -808,6 +815,63 @@ final class V2OperatorMetricsTest extends TestCase
         $this->assertSame(1, $snapshot['projections']['run_lineage_entries']['stale_projected_runs']);
         $this->assertSame(1, $snapshot['projections']['run_lineage_entries']['orphaned']);
         $this->assertSame(3, $snapshot['projections']['run_lineage_entries']['needs_rebuild']);
+    }
+
+    public function testSnapshotCanSkipSelectedRunProjectionDriftWithoutHidingUnevaluatedCorrectness(): void
+    {
+        config()->set('workflows.v2.observability.selected_run_projection_drift_enabled', false);
+
+        $run = $this->createRunWithSummary(
+            instanceId: 'metrics-bounded-observation-i',
+            runId: '01JMETRICSBOUNDEDOBSERVE1',
+            status: 'waiting',
+            statusBucket: 'running',
+            livenessState: 'waiting_for_signal',
+        );
+        WorkflowHistoryEvent::record($run, HistoryEventType::WorkflowStarted, [
+            'workflow_run_id' => $run->id,
+        ]);
+        WorkflowRunSummary::query()->whereKey($run->id)->delete();
+
+        $queries = [];
+        DB::listen(static function (QueryExecuted $query) use (&$queries): void {
+            $queries[] = strtolower((string) preg_replace('/\s+/', ' ', $query->sql));
+        });
+
+        $snapshot = OperatorMetrics::snapshot();
+
+        $this->assertSame(1, $snapshot['projections']['run_summaries']['missing']);
+        $this->assertSame(1, $snapshot['projections']['run_timeline_entries']['history_events']);
+
+        foreach (['run_waits', 'run_timeline_entries', 'run_timer_entries', 'run_lineage_entries'] as $group) {
+            $this->assertFalse($snapshot['projections'][$group]['evaluated']);
+            $this->assertSame(
+                'selected_run_projection_drift_disabled',
+                $snapshot['projections'][$group]['reason'],
+            );
+            $this->assertNull($snapshot['projections'][$group]['needs_rebuild']);
+            $this->assertNull($snapshot['projections'][$group]['stale_projected_runs']);
+        }
+
+        $health = HealthCheck::snapshot();
+        $projection = collect($health['checks'])->firstWhere('name', 'selected_run_projections');
+
+        $this->assertSame('warning', $projection['status']);
+        $this->assertFalse($projection['data']['evaluated']);
+        $this->assertSame('selected_run_projection_drift_disabled', $projection['data']['reason']);
+        $this->assertNull($projection['data']['needs_rebuild']);
+        $this->assertSame([
+            'run_waits',
+            'run_timeline_entries',
+            'run_timer_entries',
+            'run_lineage_entries',
+        ], $projection['data']['unevaluated_groups']);
+        $this->assertFalse(collect($queries)->contains(
+            static fn (string $query): bool => preg_match(
+                '/^select \* from ["`]workflow_history_events["`]/',
+                $query,
+            ) === 1 && ! str_contains($query, 'event_type'),
+        ));
     }
 
     public function testRepairCandidatesRespectDurableFailureBackoff(): void
