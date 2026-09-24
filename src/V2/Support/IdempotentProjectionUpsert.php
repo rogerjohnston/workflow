@@ -51,8 +51,9 @@ final class IdempotentProjectionUpsert
 
         try {
             if ($existing !== null) {
-                $existing->fill($values)
-                    ->save();
+                $existing->fill($values);
+                self::restoreSemanticallyEqualJsonArrays($existing);
+                $existing->save();
 
                 return $existing;
             }
@@ -68,6 +69,95 @@ final class IdempotentProjectionUpsert
 
             return self::atomicUpsert($model, $key, $values);
         }
+    }
+
+    private static function restoreSemanticallyEqualJsonArrays(Model $model): void
+    {
+        $attributes = $model->getAttributes();
+        $casts = $model->getCasts();
+        $restored = false;
+
+        foreach (array_keys($model->getDirty()) as $column) {
+            $cast = $casts[$column] ?? null;
+
+            if (! is_string($cast)
+                || ! in_array(strtolower($cast), ['array', 'json'], true)
+                || $model->hasGetMutator($column)
+                || $model->hasAttributeGetMutator($column)
+                || $model->hasSetMutator($column)
+                || $model->hasAttributeSetMutator($column)) {
+                continue;
+            }
+
+            $current = $model->getAttribute($column);
+            $original = $model->getOriginal($column);
+            $currentRaw = $attributes[$column] ?? null;
+            $originalRaw = $model->getRawOriginal($column);
+
+            if (! is_array($current)
+                || ! is_array($original)
+                || ! is_string($currentRaw)
+                || ! is_string($originalRaw)
+                || ! self::jsonValuesEqual(
+                    json_decode($currentRaw, flags: JSON_THROW_ON_ERROR),
+                    json_decode($originalRaw, flags: JSON_THROW_ON_ERROR),
+                )) {
+                continue;
+            }
+
+            $attributes[$column] = $originalRaw;
+            $restored = true;
+        }
+
+        if ($restored) {
+            $model->setRawAttributes($attributes);
+        }
+    }
+
+    private static function jsonValuesEqual(mixed $left, mixed $right): bool
+    {
+        if ($left instanceof \stdClass || $right instanceof \stdClass) {
+            if (! $left instanceof \stdClass || ! $right instanceof \stdClass) {
+                return false;
+            }
+
+            return self::jsonMapsEqual(get_object_vars($left), get_object_vars($right));
+        }
+
+        if (is_array($left) || is_array($right)) {
+            if (! is_array($left) || ! is_array($right) || count($left) !== count($right)) {
+                return false;
+            }
+
+            foreach ($left as $key => $value) {
+                if (! array_key_exists($key, $right) || ! self::jsonValuesEqual($value, $right[$key])) {
+                    return false;
+                }
+            }
+
+            return true;
+        }
+
+        return $left === $right;
+    }
+
+    /**
+     * @param array<string, mixed> $left
+     * @param array<string, mixed> $right
+     */
+    private static function jsonMapsEqual(array $left, array $right): bool
+    {
+        if (count($left) !== count($right)) {
+            return false;
+        }
+
+        foreach ($left as $key => $value) {
+            if (! array_key_exists($key, $right) || ! self::jsonValuesEqual($value, $right[$key])) {
+                return false;
+            }
+        }
+
+        return true;
     }
 
     /**

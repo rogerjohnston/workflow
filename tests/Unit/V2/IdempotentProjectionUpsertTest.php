@@ -15,6 +15,312 @@ use Workflow\V2\Support\IdempotentProjectionUpsert;
 
 final class IdempotentProjectionUpsertTest extends TestCase
 {
+    public function testPrefetchedRowSkipsWriteForSemanticallyEqualReorderedJsonAndStillRunsHooks(): void
+    {
+        $run = $this->seedRun();
+        $id = hash('sha256', $run->id . '|semantic-json-noop');
+        $row = IdempotentProjectionUpsert::upsert(
+            WorkflowTimelineEntry::class,
+            [
+                'id' => $id,
+            ],
+            [
+                ...$this->timelineAttributes($run, 'semantic-json-noop', 'unchanged'),
+                'payload' => [
+                    'alpha' => 1,
+                    'nested' => [
+                        'first' => true,
+                        'second' => false,
+                    ],
+                    'list' => [[
+                        'left' => 1,
+                        'right' => 2,
+                    ], 3],
+                ],
+            ],
+        )->fresh();
+        $row->getConnection()
+            ->table($row->getTable())
+            ->where('id', $id)
+            ->update([
+                'updated_at' => now()->subMinute(),
+            ]);
+        $row->refresh();
+        $calls = 0;
+        WorkflowTimelineEntry::saving(static function (WorkflowTimelineEntry $entry) use ($id, &$calls): void {
+            if ($entry->id === $id) {
+                $calls++;
+            }
+        });
+        $connection = $row->getConnection();
+        $connection->flushQueryLog();
+        $connection->enableQueryLog();
+
+        try {
+            $updated = IdempotentProjectionUpsert::upsert(
+                WorkflowTimelineEntry::class,
+                [
+                    'id' => $id,
+                ],
+                [
+                    'payload' => [
+                        'list' => [[
+                            'right' => 2,
+                            'left' => 1,
+                        ], 3],
+                        'nested' => [
+                            'second' => false,
+                            'first' => true,
+                        ],
+                        'alpha' => 1,
+                    ],
+                ],
+                $row,
+            );
+            $queries = $connection->getQueryLog();
+        } finally {
+            $connection->disableQueryLog();
+            WorkflowTimelineEntry::flushEventListeners();
+        }
+
+        $writes = array_filter($queries, static fn (array $query): bool => preg_match(
+            '/^(insert|update|delete)\b/i',
+            ltrim($query['query']),
+        ) === 1);
+        $this->assertSame($row, $updated);
+        $this->assertSame(1, $calls);
+        $this->assertCount(0, $writes);
+    }
+
+    public function testSemanticJsonNoopPreservesSavingHookMutationsAndTimestamps(): void
+    {
+        $run = $this->seedRun();
+        $id = hash('sha256', $run->id . '|semantic-hook');
+        $row = IdempotentProjectionUpsert::upsert(
+            WorkflowTimelineEntry::class,
+            [
+                'id' => $id,
+            ],
+            [
+                ...$this->timelineAttributes($run, 'semantic-hook', 'before'),
+                'payload' => [
+                    'first' => 1,
+                    'second' => 2,
+                ],
+            ],
+        )->fresh();
+        $row->getConnection()
+            ->table($row->getTable())
+            ->where('id', $id)
+            ->update([
+                'updated_at' => now()->subMinute(),
+            ]);
+        $row->refresh();
+        $originalUpdatedAt = $row->updated_at;
+        WorkflowTimelineEntry::saving(static function (WorkflowTimelineEntry $entry) use ($id): void {
+            if ($entry->id === $id) {
+                $entry->summary = 'changed by saving hook';
+            }
+        });
+        $connection = $row->getConnection();
+        $connection->flushQueryLog();
+        $connection->enableQueryLog();
+
+        try {
+            IdempotentProjectionUpsert::upsert(
+                WorkflowTimelineEntry::class,
+                [
+                    'id' => $id,
+                ],
+                [
+                    'payload' => [
+                        'second' => 2,
+                        'first' => 1,
+                    ],
+                ],
+                $row,
+            );
+            $queries = $connection->getQueryLog();
+        } finally {
+            $connection->disableQueryLog();
+            WorkflowTimelineEntry::flushEventListeners();
+        }
+
+        $writes = array_filter($queries, static fn (array $query): bool => str_starts_with(
+            strtolower(ltrim($query['query'])),
+            'update',
+        ));
+        $fresh = $row->fresh();
+        $this->assertCount(1, $writes);
+        $this->assertSame('changed by saving hook', $fresh->summary);
+        $this->assertTrue($fresh->updated_at->greaterThan($originalUpdatedAt));
+    }
+
+    #[\PHPUnit\Framework\Attributes\DataProvider('genuineJsonChanges')]
+    public function testPrefetchedRowPersistsGenuineJsonChanges(array $before, array $after): void
+    {
+        $run = $this->seedRun();
+        $id = hash('sha256', $run->id . '|genuine-json-change');
+        $row = IdempotentProjectionUpsert::upsert(
+            WorkflowTimelineEntry::class,
+            [
+                'id' => $id,
+            ],
+            [
+                ...$this->timelineAttributes($run, 'genuine-json-change', 'unchanged'),
+                'payload' => $before,
+            ],
+        )->fresh();
+        $connection = $row->getConnection();
+        $connection->flushQueryLog();
+        $connection->enableQueryLog();
+
+        try {
+            IdempotentProjectionUpsert::upsert(
+                WorkflowTimelineEntry::class,
+                [
+                    'id' => $id,
+                ],
+                [
+                    'payload' => $after,
+                ],
+                $row,
+            );
+            $queries = $connection->getQueryLog();
+        } finally {
+            $connection->disableQueryLog();
+        }
+
+        $writes = array_filter($queries, static fn (array $query): bool => str_starts_with(
+            strtolower(ltrim($query['query'])),
+            'update',
+        ));
+        $this->assertCount(1, $writes);
+        $this->assertSame($after, $row->fresh()->payload);
+    }
+
+    public static function genuineJsonChanges(): iterable
+    {
+        yield 'list order remains significant' => [
+            [
+                'items' => [1, 2],
+            ],
+            [
+                'items' => [2, 1],
+            ],
+        ];
+        yield 'scalar types remain significant' => [
+            [
+                'value' => 1,
+            ],
+            [
+                'value' => '1',
+            ],
+        ];
+    }
+
+    public function testPrefetchedRowPreservesJsonObjectAndListDistinction(): void
+    {
+        $run = $this->seedRun();
+        $id = hash('sha256', $run->id . '|json-container-kind');
+        $row = IdempotentProjectionUpsert::upsert(
+            WorkflowTimelineEntry::class,
+            [
+                'id' => $id,
+            ],
+            [
+                ...$this->timelineAttributes($run, 'json-container-kind', 'unchanged'),
+                'payload' => [
+                    'items' => ['a', 'b'],
+                ],
+            ],
+        )->fresh();
+        $connection = $row->getConnection();
+        $connection->flushQueryLog();
+        $connection->enableQueryLog();
+
+        try {
+            IdempotentProjectionUpsert::upsert(
+                WorkflowTimelineEntry::class,
+                [
+                    'id' => $id,
+                ],
+                [
+                    'payload' => [
+                        'items' => [
+                            1 => 'b',
+                            0 => 'a',
+                        ],
+                    ],
+                ],
+                $row,
+            );
+            $queries = $connection->getQueryLog();
+        } finally {
+            $connection->disableQueryLog();
+        }
+
+        $writes = array_filter($queries, static fn (array $query): bool => str_starts_with(
+            strtolower(ltrim($query['query'])),
+            'update',
+        ));
+        $payload = $connection->table($row->getTable())
+            ->where('id', $id)
+            ->value('payload');
+        $stored = json_decode((string) $payload, flags: JSON_THROW_ON_ERROR);
+        $this->assertCount(1, $writes);
+        $this->assertInstanceOf(\stdClass::class, $stored->items);
+    }
+
+    public function testSemanticJsonNoopDoesNotHideAnotherColumnChange(): void
+    {
+        $run = $this->seedRun();
+        $id = hash('sha256', $run->id . '|json-noop-column-change');
+        $row = IdempotentProjectionUpsert::upsert(
+            WorkflowTimelineEntry::class,
+            [
+                'id' => $id,
+            ],
+            [
+                ...$this->timelineAttributes($run, 'json-noop-column-change', 'before'),
+                'payload' => [
+                    'first' => 1,
+                    'second' => 2,
+                ],
+            ],
+        )->fresh();
+        $connection = $row->getConnection();
+        $connection->flushQueryLog();
+        $connection->enableQueryLog();
+
+        try {
+            IdempotentProjectionUpsert::upsert(
+                WorkflowTimelineEntry::class,
+                [
+                    'id' => $id,
+                ],
+                [
+                    'summary' => 'after',
+                    'payload' => [
+                        'second' => 2,
+                        'first' => 1,
+                    ],
+                ],
+                $row,
+            );
+            $queries = $connection->getQueryLog();
+        } finally {
+            $connection->disableQueryLog();
+        }
+
+        $writes = array_filter($queries, static fn (array $query): bool => str_starts_with(
+            strtolower(ltrim($query['query'])),
+            'update',
+        ));
+        $this->assertCount(1, $writes);
+        $this->assertSame('after', $row->fresh()->summary);
+    }
+
     public function testPrefetchedRowRetainsModelHooksWithoutAnotherSelect(): void
     {
         $run = $this->seedRun();
