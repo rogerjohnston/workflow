@@ -62,10 +62,13 @@ final class ActivitySnapshot
     /**
      * @return array<string, mixed>|null
      */
-    public static function fromEvent(WorkflowHistoryEvent $event): ?array
+    public static function fromEvent(WorkflowHistoryEvent $event, ?array $payload = null): ?array
     {
-        /** @var array<string, mixed> $payload */
-        $payload = is_array($event->payload) ? $event->payload : [];
+        if ($payload === null) {
+            $payload = $event->payload;
+            /** @var array<string, mixed> $payload */
+            $payload = is_array($payload) ? $payload : [];
+        }
         $snapshot = is_array($payload['activity'] ?? null) ? $payload['activity'] : [];
         $taskSnapshot = is_array($payload['task'] ?? null) ? $payload['task'] : [];
         $activityId = self::stringValue($snapshot['id'] ?? null)

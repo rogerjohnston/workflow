@@ -114,8 +114,9 @@ final class ActivityAttemptSnapshots
      */
     private static function fromEvent(WorkflowHistoryEvent $event): ?array
     {
+        $payload = $event->payload;
         /** @var array<string, mixed> $payload */
-        $payload = is_array($event->payload) ? $event->payload : [];
+        $payload = is_array($payload) ? $payload : [];
         $activity = is_array($payload['activity'] ?? null) ? $payload['activity'] : [];
         $attempt = is_array($payload['activity_attempt'] ?? null) ? $payload['activity_attempt'] : [];
         $task = is_array($payload['task'] ?? null) ? $payload['task'] : [];
