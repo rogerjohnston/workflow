@@ -68,6 +68,96 @@ final class WorkflowStepHistoryTest extends TestCase
         $this->addToAssertionCount(1);
     }
 
+    public function testCompatibilityReadsEachTypedPayloadOnceAndSortsOnlyMatchingSequenceEvents(): void
+    {
+        $unrelated = [];
+
+        for ($index = 1; $index <= 200; $index++) {
+            $unrelated[] = $this->countingHistoryEvent(
+                HistoryEventType::ActivityScheduled,
+                [
+                    'sequence' => 100 + $index,
+                    'activity_type' => "unrelated-{$index}",
+                ],
+                $index,
+            );
+        }
+
+        $matching = [
+            $this->countingHistoryEvent(HistoryEventType::ActivityCompleted, [
+                'sequence' => 7,
+                'activity_type' => 'expected-activity',
+            ], 202),
+            $this->countingHistoryEvent(HistoryEventType::ActivityScheduled, [
+                'sequence' => 7,
+                'activity_type' => 'expected-activity',
+            ], 201),
+        ];
+        $run = $this->runWithHistoryEvents([...$unrelated, ...$matching]);
+
+        WorkflowStepHistory::assertCompatible($run, 7, WorkflowStepHistory::ACTIVITY, [
+            'activity_type' => 'expected-activity',
+        ]);
+
+        foreach ($unrelated as $event) {
+            $this->assertSame(1, $event->payloadReads);
+            $this->assertSame(0, $event->historySequenceReads);
+        }
+
+        foreach ($matching as $event) {
+            $this->assertSame(1, $event->payloadReads);
+            $this->assertSame(1, $event->historySequenceReads);
+        }
+    }
+
+    public function testCompatibilityPreservesHistoryOrderShapePrecedenceAndSeesFreshPayloadMutations(): void
+    {
+        $activity = $this->countingHistoryEvent(HistoryEventType::ActivityScheduled, [
+            'sequence' => 3,
+            'activity_type' => 'old-activity',
+        ], 30);
+        $child = $this->countingHistoryEvent(HistoryEventType::ChildWorkflowScheduled, [
+            'sequence' => 3,
+        ], 10);
+        $duplicateActivity = $this->countingHistoryEvent(HistoryEventType::ActivityCompleted, [
+            'sequence' => 3,
+            'activity_type' => 'old-activity',
+        ], 20);
+        $run = $this->runWithHistoryEvents([$activity, $child, $duplicateActivity]);
+
+        $this->assertSame(
+            [
+                HistoryEventType::ChildWorkflowScheduled->value,
+                HistoryEventType::ActivityCompleted->value,
+                HistoryEventType::ActivityScheduled->value,
+            ],
+            WorkflowStepHistory::conflictingEventTypesForSequence($run, 3, WorkflowStepHistory::TIMER),
+        );
+
+        try {
+            WorkflowStepHistory::assertCompatible($run, 3, WorkflowStepHistory::ACTIVITY, [
+                'activity_type' => 'new-activity',
+            ]);
+            $this->fail('Expected the shape mismatch to take precedence over detail drift.');
+        } catch (HistoryEventShapeMismatchException $exception) {
+            $this->assertStringContainsString('current workflow yielded activity.', $exception->getMessage());
+            $this->assertStringNotContainsString('Recorded activity_type', $exception->getMessage());
+        }
+
+        $child->forceFill([
+            'payload' => [
+                'sequence' => 99,
+            ],
+        ]);
+
+        $this->expectException(HistoryEventShapeMismatchException::class);
+        $this->expectExceptionMessage('Recorded activity_type [old-activity]');
+
+        WorkflowStepHistory::assertCompatible($run, 3, WorkflowStepHistory::ACTIVITY, [
+            'activity_type' => 'new-activity',
+        ]);
+    }
+
     /**
      * @param list<WorkflowHistoryEvent> $events
      */
@@ -92,5 +182,43 @@ final class WorkflowStepHistoryTest extends TestCase
         ]);
 
         return $event;
+    }
+
+    /**
+     * @param array<string, mixed> $payload
+     */
+    private function countingHistoryEvent(
+        HistoryEventType $type,
+        array $payload,
+        int $historySequence,
+    ): CountingWorkflowHistoryEvent {
+        $event = new CountingWorkflowHistoryEvent();
+        $event->forceFill([
+            'sequence' => $historySequence,
+            'event_type' => $type->value,
+            'payload' => $payload,
+        ]);
+
+        return $event;
+    }
+}
+
+final class CountingWorkflowHistoryEvent extends WorkflowHistoryEvent
+{
+    public int $payloadReads = 0;
+
+    public int $historySequenceReads = 0;
+
+    public function getAttribute($key)
+    {
+        if ($key === 'payload') {
+            $this->payloadReads++;
+        }
+
+        if ($key === 'sequence') {
+            $this->historySequenceReads++;
+        }
+
+        return parent::getAttribute($key);
     }
 }

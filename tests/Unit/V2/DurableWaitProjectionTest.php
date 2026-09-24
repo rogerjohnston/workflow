@@ -19,6 +19,69 @@ use Workflow\V2\Support\SignalWaits;
 
 final class DurableWaitProjectionTest extends TestCase
 {
+    public function testSignalWaitProjectionSkipsUnrelatedPayloadsAndDecodesEachRelevantEventOnce(): void
+    {
+        $events = [];
+
+        for ($sequence = 1; $sequence <= 200; $sequence++) {
+            $event = new SignalWaitPayloadCountingEvent();
+            $event->forceFill([
+                'sequence' => $sequence,
+                'event_type' => HistoryEventType::ActivityCompleted->value,
+                'payload' => [
+                    'sequence' => $sequence,
+                    'output' => str_repeat('history', 100),
+                ],
+            ]);
+            $events[] = $event;
+        }
+
+        $opened = new SignalWaitPayloadCountingEvent();
+        $opened->forceFill([
+            'sequence' => 201,
+            'event_type' => HistoryEventType::SignalWaitOpened->value,
+            'payload' => [
+                'signal_name' => 'approval',
+                'sequence' => 201,
+            ],
+        ]);
+        $applied = new SignalWaitPayloadCountingEvent();
+        $applied->forceFill([
+            'sequence' => 202,
+            'event_type' => HistoryEventType::SignalApplied->value,
+            'payload' => [
+                'signal_name' => 'approval',
+                'signal_id' => 'first-signal',
+                'command' => [
+                    'id' => 'command-1',
+                    'sequence' => 7,
+                    'outcome' => 'signal_applied',
+                ],
+            ],
+        ]);
+        $run = $this->runWithHistoryEvents([$applied, ...array_reverse($events), $opened]);
+
+        $waits = SignalWaits::forRun($run);
+
+        $this->assertCount(1, $waits);
+        $this->assertSame('signal:201:approval', $waits[0]['signal_wait_id']);
+        $this->assertSame('applied', $waits[0]['source_status']);
+        $this->assertSame('command-1', $waits[0]['command_id']);
+        $this->assertSame(7, $waits[0]['command_sequence']);
+        $this->assertSame('signal_applied', $waits[0]['command_outcome']);
+        $this->assertSame(0, array_sum(array_column($events, 'payloadReads')));
+        $this->assertSame(0, array_sum(array_column($events, 'sequenceReads')));
+        $this->assertSame(1, $opened->payloadReads);
+        $this->assertSame(1, $applied->payloadReads);
+
+        $applied->payload = [
+            'signal_name' => 'approval',
+            'signal_id' => 'changed-signal',
+        ];
+
+        $this->assertSame('changed-signal', SignalWaits::forRun($run)[0]['signal_id']);
+    }
+
     public function testConditionWaitProjectionReconstructsTimeoutResolutionAndCancellation(): void
     {
         $deadline = Carbon::parse('2026-08-27T12:00:20Z');
@@ -530,5 +593,25 @@ final class DurableWaitProjectionTest extends TestCase
         return $value instanceof \Carbon\CarbonInterface
             ? $value->toIso8601String()
             : null;
+    }
+}
+
+final class SignalWaitPayloadCountingEvent extends WorkflowHistoryEvent
+{
+    public int $payloadReads = 0;
+
+    public int $sequenceReads = 0;
+
+    public function getAttribute($key)
+    {
+        if ($key === 'payload') {
+            $this->payloadReads++;
+        }
+
+        if ($key === 'sequence') {
+            $this->sequenceReads++;
+        }
+
+        return parent::getAttribute($key);
     }
 }

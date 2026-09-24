@@ -44,19 +44,40 @@ final class SignalWaits
         $waits = [];
         $openWaitIdsByName = [];
 
-        foreach ($run->historyEvents->sortBy('sequence') as $event) {
+        $events = $run->historyEvents->filter(
+            static fn (mixed $event): bool =>
+            $event instanceof WorkflowHistoryEvent && in_array($event->event_type, [
+                HistoryEventType::SignalWaitOpened,
+                HistoryEventType::TimerScheduled,
+                HistoryEventType::TimerFired,
+                HistoryEventType::TimerCancelled,
+                HistoryEventType::SelectionOperationCancelled,
+                HistoryEventType::SignalReceived,
+                HistoryEventType::SignalApplied,
+                HistoryEventType::WorkflowCompleted,
+                HistoryEventType::WorkflowFailed,
+                HistoryEventType::WorkflowCancelled,
+                HistoryEventType::WorkflowTerminated,
+                HistoryEventType::WorkflowContinuedAsNew,
+            ], true)
+        );
+
+        foreach ($events->sortBy('sequence') as $event) {
             if (! $event instanceof WorkflowHistoryEvent) {
                 continue;
             }
 
-            $signalName = self::stringValue($event->payload['signal_name'] ?? null);
+            $eventType = $event->event_type;
+            $payload = $event->payload;
+            $payload = is_array($payload) ? $payload : [];
+            $signalName = self::stringValue($payload['signal_name'] ?? null);
 
-            if ($event->event_type === HistoryEventType::SignalWaitOpened) {
+            if ($eventType === HistoryEventType::SignalWaitOpened) {
                 if ($signalName === null) {
                     continue;
                 }
 
-                $waitId = self::waitIdForOpenedEvent($event);
+                $waitId = self::waitIdForOpenedEvent($payload);
 
                 if ($waitId === null) {
                     continue;
@@ -67,14 +88,14 @@ final class SignalWaits
                     'signal_wait_id' => $waitId,
                     'signal_id' => null,
                     'signal_name' => $signalName,
-                    'sequence' => self::intValue($event->payload['sequence'] ?? null),
+                    'sequence' => self::intValue($payload['sequence'] ?? null),
                     'status' => 'open',
                     'source_status' => 'waiting',
                     'opened_at' => $event->recorded_at ?? $event->created_at,
                     'deadline_at' => null,
                     'resolved_at' => null,
                     'timeout_fired_at' => null,
-                    'timeout_seconds' => self::intValue($event->payload['timeout_seconds'] ?? null),
+                    'timeout_seconds' => self::intValue($payload['timeout_seconds'] ?? null),
                     'timer_id' => null,
                     'command_id' => null,
                     'command_sequence' => null,
@@ -89,19 +110,19 @@ final class SignalWaits
             }
 
             if (
-                in_array($event->event_type, [
+                in_array($eventType, [
                     HistoryEventType::TimerScheduled,
                     HistoryEventType::TimerFired,
                     HistoryEventType::TimerCancelled,
                 ], true)
-                && self::stringValue($event->payload['timer_kind'] ?? null) === 'signal_timeout'
+                && self::stringValue($payload['timer_kind'] ?? null) === 'signal_timeout'
             ) {
                 if ($signalName === null) {
                     continue;
                 }
 
-                $explicitWaitId = self::stringValue($event->payload['signal_wait_id'] ?? null);
-                $waitId = $event->event_type === HistoryEventType::TimerScheduled
+                $explicitWaitId = self::stringValue($payload['signal_wait_id'] ?? null);
+                $waitId = $eventType === HistoryEventType::TimerScheduled
                     ? $explicitWaitId
                     : self::consumeOpenWaitId($openWaitIdsByName, $signalName, $explicitWaitId);
 
@@ -109,15 +130,15 @@ final class SignalWaits
                     continue;
                 }
 
-                $waits[$waitId]['timer_id'] = self::stringValue($event->payload['timer_id'] ?? null)
+                $waits[$waitId]['timer_id'] = self::stringValue($payload['timer_id'] ?? null)
                     ?? $waits[$waitId]['timer_id'];
-                $waits[$waitId]['timeout_seconds'] = self::intValue($event->payload['delay_seconds'] ?? null)
-                    ?? self::intValue($event->payload['timeout_seconds'] ?? null)
+                $waits[$waitId]['timeout_seconds'] = self::intValue($payload['delay_seconds'] ?? null)
+                    ?? self::intValue($payload['timeout_seconds'] ?? null)
                     ?? $waits[$waitId]['timeout_seconds'];
-                $waits[$waitId]['deadline_at'] = self::timestamp($event->payload['fire_at'] ?? null)
+                $waits[$waitId]['deadline_at'] = self::timestamp($payload['fire_at'] ?? null)
                     ?? $waits[$waitId]['deadline_at'];
 
-                if ($event->event_type === HistoryEventType::TimerScheduled) {
+                if ($eventType === HistoryEventType::TimerScheduled) {
                     continue;
                 }
 
@@ -125,32 +146,27 @@ final class SignalWaits
                     continue;
                 }
 
-                $waits[$waitId]['status'] = $event->event_type === HistoryEventType::TimerFired
+                $waits[$waitId]['status'] = $eventType === HistoryEventType::TimerFired
                     ? 'resolved'
                     : 'cancelled';
-                $waits[$waitId]['source_status'] = $event->event_type === HistoryEventType::TimerFired
+                $waits[$waitId]['source_status'] = $eventType === HistoryEventType::TimerFired
                     ? 'timed_out'
                     : 'timeout_cancelled';
                 $waits[$waitId]['resolved_at'] = $event->recorded_at ?? $event->created_at;
-                $waits[$waitId]['timeout_fired_at'] = $event->event_type === HistoryEventType::TimerFired
-                    ? self::timestamp(
-                        $event->payload['fired_at'] ?? null
-                    ) ?? ($event->recorded_at ?? $event->created_at)
+                $waits[$waitId]['timeout_fired_at'] = $eventType === HistoryEventType::TimerFired
+                    ? self::timestamp($payload['fired_at'] ?? null) ?? ($event->recorded_at ?? $event->created_at)
                     : $waits[$waitId]['timeout_fired_at'];
 
                 continue;
             }
 
-            if ($event->event_type === HistoryEventType::SelectionOperationCancelled) {
-                self::closeCancelledSelectionWaits($waits, $openWaitIdsByName, $event);
+            if ($eventType === HistoryEventType::SelectionOperationCancelled) {
+                self::closeCancelledSelectionWaits($waits, $openWaitIdsByName, $event, $payload);
 
                 continue;
             }
 
-            if (in_array($event->event_type, [
-                HistoryEventType::SignalReceived,
-                HistoryEventType::SignalApplied,
-            ], true)) {
+            if (in_array($eventType, [HistoryEventType::SignalReceived, HistoryEventType::SignalApplied], true)) {
                 if ($signalName === null) {
                     continue;
                 }
@@ -158,7 +174,7 @@ final class SignalWaits
                 $waitId = self::consumeOpenWaitId(
                     $openWaitIdsByName,
                     $signalName,
-                    self::stringValue($event->payload['signal_wait_id'] ?? null),
+                    self::stringValue($payload['signal_wait_id'] ?? null),
                 );
 
                 if ($waitId === null || ! isset($waits[$waitId])) {
@@ -167,7 +183,7 @@ final class SignalWaits
 
                 $currentStatus = $waits[$waitId]['status'] ?? null;
                 $currentSourceStatus = $waits[$waitId]['source_status'] ?? null;
-                $canApplyReceivedSignal = $event->event_type === HistoryEventType::SignalApplied
+                $canApplyReceivedSignal = $eventType === HistoryEventType::SignalApplied
                     && $currentStatus === 'resolved'
                     && $currentSourceStatus === 'received';
 
@@ -176,23 +192,23 @@ final class SignalWaits
                 }
 
                 $waits[$waitId]['status'] = 'resolved';
-                $waits[$waitId]['source_status'] = $event->event_type === HistoryEventType::SignalApplied
+                $waits[$waitId]['source_status'] = $eventType === HistoryEventType::SignalApplied
                     ? 'applied'
                     : 'received';
-                $waits[$waitId]['signal_id'] = self::stringValue($event->payload['signal_id'] ?? null)
+                $waits[$waitId]['signal_id'] = self::stringValue($payload['signal_id'] ?? null)
                     ?? $waits[$waitId]['signal_id'];
                 $waits[$waitId]['resolved_at'] = $event->recorded_at ?? $event->created_at;
                 $waits[$waitId]['command_id'] = self::stringValue($event->workflow_command_id)
-                    ?? self::stringValue($event->payload['workflow_command_id'] ?? null)
-                    ?? self::stringValue(self::commandSnapshot($event)['id'] ?? null);
-                $waits[$waitId]['command_sequence'] = self::commandSequence($event);
-                $waits[$waitId]['command_status'] = self::commandStatus($event);
-                $waits[$waitId]['command_outcome'] = self::commandOutcome($event);
+                    ?? self::stringValue($payload['workflow_command_id'] ?? null)
+                    ?? self::stringValue(self::commandSnapshot($payload)['id'] ?? null);
+                $waits[$waitId]['command_sequence'] = self::commandSequence($payload);
+                $waits[$waitId]['command_status'] = self::commandStatus($event, $payload);
+                $waits[$waitId]['command_outcome'] = self::commandOutcome($event, $payload);
 
                 continue;
             }
 
-            if (in_array($event->event_type, [
+            if (in_array($eventType, [
                 HistoryEventType::WorkflowCompleted,
                 HistoryEventType::WorkflowFailed,
                 HistoryEventType::WorkflowCancelled,
@@ -241,14 +257,16 @@ final class SignalWaits
     /**
      * @param array<string, array<string, mixed>> $waits
      * @param array<string, list<string>> $openWaitIdsByName
+     * @param array<string, mixed> $payload
      */
     private static function closeCancelledSelectionWaits(
         array &$waits,
         array &$openWaitIdsByName,
         WorkflowHistoryEvent $event,
+        array $payload,
     ): void {
-        $baseSequence = self::intValue($event->payload['member_base_sequence'] ?? null);
-        $memberSize = self::intValue($event->payload['member_size'] ?? null);
+        $baseSequence = self::intValue($payload['member_base_sequence'] ?? null);
+        $memberSize = self::intValue($payload['member_size'] ?? null);
 
         if ($baseSequence === null || $memberSize === null || $memberSize < 1) {
             return;
@@ -340,16 +358,19 @@ final class SignalWaits
             : null;
     }
 
-    private static function waitIdForOpenedEvent(WorkflowHistoryEvent $event): ?string
+    /**
+     * @param array<string, mixed> $payload
+     */
+    private static function waitIdForOpenedEvent(array $payload): ?string
     {
-        $waitId = self::stringValue($event->payload['signal_wait_id'] ?? null);
+        $waitId = self::stringValue($payload['signal_wait_id'] ?? null);
 
         if ($waitId !== null) {
             return $waitId;
         }
 
-        $signalName = self::stringValue($event->payload['signal_name'] ?? null);
-        $sequence = self::intValue($event->payload['sequence'] ?? null);
+        $signalName = self::stringValue($payload['signal_name'] ?? null);
+        $sequence = self::intValue($payload['sequence'] ?? null);
 
         if ($signalName === null || $sequence === null) {
             return null;
@@ -388,25 +409,32 @@ final class SignalWaits
     }
 
     /**
+     * @param array<string, mixed> $payload
      * @return array<string, mixed>
      */
-    private static function commandSnapshot(WorkflowHistoryEvent $event): array
+    private static function commandSnapshot(array $payload): array
     {
-        $snapshot = $event->payload['command'] ?? null;
+        $snapshot = $payload['command'] ?? null;
 
         return is_array($snapshot)
             ? $snapshot
             : [];
     }
 
-    private static function commandSequence(WorkflowHistoryEvent $event): ?int
+    /**
+     * @param array<string, mixed> $payload
+     */
+    private static function commandSequence(array $payload): ?int
     {
-        return self::intValue(self::commandSnapshot($event)['sequence'] ?? null);
+        return self::intValue(self::commandSnapshot($payload)['sequence'] ?? null);
     }
 
-    private static function commandStatus(WorkflowHistoryEvent $event): ?string
+    /**
+     * @param array<string, mixed> $payload
+     */
+    private static function commandStatus(WorkflowHistoryEvent $event, array $payload): ?string
     {
-        $status = self::stringValue(self::commandSnapshot($event)['status'] ?? null);
+        $status = self::stringValue(self::commandSnapshot($payload)['status'] ?? null);
 
         return match ($event->event_type) {
             HistoryEventType::SignalReceived,
@@ -415,10 +443,13 @@ final class SignalWaits
         };
     }
 
-    private static function commandOutcome(WorkflowHistoryEvent $event): ?string
+    /**
+     * @param array<string, mixed> $payload
+     */
+    private static function commandOutcome(WorkflowHistoryEvent $event, array $payload): ?string
     {
-        $outcome = self::stringValue($event->payload['outcome'] ?? null)
-            ?? self::stringValue(self::commandSnapshot($event)['outcome'] ?? null);
+        $outcome = self::stringValue($payload['outcome'] ?? null)
+            ?? self::stringValue(self::commandSnapshot($payload)['outcome'] ?? null);
 
         return $outcome ?? match ($event->event_type) {
             HistoryEventType::SignalReceived,

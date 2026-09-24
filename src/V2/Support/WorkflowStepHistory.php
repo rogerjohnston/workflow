@@ -79,13 +79,14 @@ final class WorkflowStepHistory
         string $expectedShape,
         array $expectedDetails = [],
     ): void {
-        $conflictingEventTypes = self::conflictingEventTypesForSequence($run, $sequence, $expectedShape);
+        $events = self::workflowStepEventsForSequence($run, $sequence);
+        $conflictingEventTypes = self::conflictingEventTypes($events, $expectedShape);
 
         if ($conflictingEventTypes !== []) {
             throw new HistoryEventShapeMismatchException($sequence, $expectedShape, $conflictingEventTypes);
         }
 
-        $detailMismatch = self::detailMismatchForSequence($run, $sequence, $expectedShape, $expectedDetails);
+        $detailMismatch = self::detailMismatch($events, $expectedShape, $expectedDetails);
 
         if ($detailMismatch !== null) {
             throw new HistoryEventShapeMismatchException(
@@ -169,41 +170,35 @@ final class WorkflowStepHistory
         int $sequence,
         string $expectedShape,
     ): array {
+        return self::conflictingEventTypes(self::workflowStepEventsForSequence($run, $sequence), $expectedShape);
+    }
+
+    /**
+     * @param list<array{event: WorkflowHistoryEvent, payload: array<string, mixed>, history_sequence: mixed}> $events
+     * @return list<string>
+     */
+    private static function conflictingEventTypes(array $events, string $expectedShape): array
+    {
         $eventTypes = [];
 
-        foreach (self::historyEventsForRun($run)->sortBy('sequence') as $event) {
-            if (! $event instanceof WorkflowHistoryEvent) {
+        foreach ($events as $selected) {
+            if (self::eventMatchesShape($selected['event'], $selected['payload'], $expectedShape)) {
                 continue;
             }
 
-            if (! self::isWorkflowStepEvent($event)) {
-                continue;
-            }
-
-            if (self::intValue($event->payload['sequence'] ?? null) !== $sequence) {
-                continue;
-            }
-
-            if (self::eventMatchesShape($event, $expectedShape)) {
-                continue;
-            }
-
-            $eventTypes[] = $event->event_type->value;
+            $eventTypes[] = $selected['event']->event_type->value;
         }
 
         return array_values(array_unique($eventTypes));
     }
 
     /**
+     * @param list<array{event: WorkflowHistoryEvent, payload: array<string, mixed>, history_sequence: mixed}> $events
      * @param array<string, string|null> $expectedDetails
      * @return array{recorded_event_types: list<string>, message: string}|null
      */
-    private static function detailMismatchForSequence(
-        WorkflowRun $run,
-        int $sequence,
-        string $expectedShape,
-        array $expectedDetails,
-    ): ?array {
+    private static function detailMismatch(array $events, string $expectedShape, array $expectedDetails): ?array
+    {
         $expectedField = self::detailFieldForShape($expectedShape);
 
         if ($expectedField === null) {
@@ -216,20 +211,15 @@ final class WorkflowStepHistory
             return null;
         }
 
-        foreach (self::historyEventsForRun($run)->sortBy('sequence') as $event) {
-            if (! $event instanceof WorkflowHistoryEvent) {
+        foreach ($events as $selected) {
+            $event = $selected['event'];
+            $payload = $selected['payload'];
+
+            if (! self::eventMatchesShape($event, $payload, $expectedShape)) {
                 continue;
             }
 
-            if (! self::isWorkflowStepEvent($event) || ! self::eventMatchesShape($event, $expectedShape)) {
-                continue;
-            }
-
-            if (self::intValue($event->payload['sequence'] ?? null) !== $sequence) {
-                continue;
-            }
-
-            $recorded = self::recordedDetail($event, $expectedField);
+            $recorded = self::recordedDetail($payload, $expectedField);
 
             if (
                 $recorded === null
@@ -264,21 +254,21 @@ final class WorkflowStepHistory
         };
     }
 
-    private static function recordedDetail(WorkflowHistoryEvent $event, string $field): ?string
+    private static function recordedDetail(array $payload, string $field): ?string
     {
-        $value = self::stringValue($event->payload[$field] ?? null);
+        $value = self::stringValue($payload[$field] ?? null);
 
         if ($value !== null) {
             return $value;
         }
 
         if ($field === 'activity_type') {
-            return self::stringValue($event->payload['activity_class'] ?? null);
+            return self::stringValue($payload['activity_class'] ?? null);
         }
 
         if ($field === 'child_workflow_type') {
             foreach (['workflow_type', 'child_workflow_class', 'workflow_class'] as $fallbackField) {
-                $fallback = self::stringValue($event->payload[$fallbackField] ?? null);
+                $fallback = self::stringValue($payload[$fallbackField] ?? null);
 
                 if ($fallback !== null) {
                     return $fallback;
@@ -332,8 +322,11 @@ final class WorkflowStepHistory
             : "{$expectedShape}:{$expected}";
     }
 
-    private static function eventMatchesShape(WorkflowHistoryEvent $event, string $expectedShape): bool
-    {
+    private static function eventMatchesShape(
+        WorkflowHistoryEvent $event,
+        array $payload,
+        string $expectedShape,
+    ): bool {
         return match ($expectedShape) {
             self::ACTIVITY => in_array($event->event_type, [
                 HistoryEventType::ActivityScheduled,
@@ -344,7 +337,7 @@ final class WorkflowStepHistory
                 HistoryEventType::ActivityFailed,
                 HistoryEventType::ActivityCancelled,
                 HistoryEventType::ActivityTimedOut,
-            ], true) && ! self::isLocalActivityEvent($event),
+            ], true) && ! self::isLocalActivityEvent($payload),
             self::LOCAL_ACTIVITY => in_array($event->event_type, [
                 HistoryEventType::ActivityScheduled,
                 HistoryEventType::ActivityStarted,
@@ -354,7 +347,7 @@ final class WorkflowStepHistory
                 HistoryEventType::ActivityFailed,
                 HistoryEventType::ActivityCancelled,
                 HistoryEventType::ActivityTimedOut,
-            ], true) && self::isLocalActivityEvent($event),
+            ], true) && self::isLocalActivityEvent($payload),
             self::CHILD_WORKFLOW => in_array($event->event_type, [
                 HistoryEventType::ChildWorkflowScheduled,
                 HistoryEventType::ChildRunStarted,
@@ -369,16 +362,16 @@ final class WorkflowStepHistory
                 HistoryEventType::ServiceCallFailed,
                 HistoryEventType::ServiceCallCancelled,
             ], true),
-            self::CONDITION_WAIT => self::isConditionWaitEvent($event),
+            self::CONDITION_WAIT => self::isConditionWaitEvent($event, $payload),
             self::CONTINUE_AS_NEW => $event->event_type === HistoryEventType::WorkflowContinuedAsNew,
             self::SIGNAL_WAIT => in_array($event->event_type, [
                 HistoryEventType::SignalWaitOpened,
                 HistoryEventType::SignalApplied,
-            ], true) || self::isSignalWaitTimerEvent($event),
+            ], true) || self::isSignalWaitTimerEvent($event, $payload),
             self::MEMO_UPSERT => $event->event_type === HistoryEventType::MemoUpserted,
             self::SEARCH_ATTRIBUTES_UPSERT => $event->event_type === HistoryEventType::SearchAttributesUpserted,
             self::SIDE_EFFECT => $event->event_type === HistoryEventType::SideEffectRecorded,
-            self::TIMER => self::isPureTimerEvent($event),
+            self::TIMER => self::isPureTimerEvent($event, $payload),
             self::VERSION_MARKER => $event->event_type === HistoryEventType::VersionMarkerRecorded,
             default => false,
         };
@@ -491,13 +484,19 @@ final class WorkflowStepHistory
         ], true);
     }
 
-    private static function isLocalActivityEvent(WorkflowHistoryEvent $event): bool
+    /**
+     * @param array<string, mixed> $payload
+     */
+    private static function isLocalActivityEvent(array $payload): bool
     {
-        return self::stringValue($event->payload['execution_mode'] ?? null) === LocalActivityRuntime::EXECUTION_MODE
-            || ($event->payload['local_activity'] ?? null) === true;
+        return self::stringValue($payload['execution_mode'] ?? null) === LocalActivityRuntime::EXECUTION_MODE
+            || ($payload['local_activity'] ?? null) === true;
     }
 
-    private static function isConditionWaitEvent(WorkflowHistoryEvent $event): bool
+    /**
+     * @param array<string, mixed> $payload
+     */
+    private static function isConditionWaitEvent(WorkflowHistoryEvent $event, array $payload): bool
     {
         if (in_array($event->event_type, [
             HistoryEventType::ConditionWaitOpened,
@@ -512,27 +511,33 @@ final class WorkflowStepHistory
             HistoryEventType::TimerFired,
             HistoryEventType::TimerCancelled,
         ], true)
-            && self::stringValue($event->payload['timer_kind'] ?? null) === 'condition_timeout';
+            && self::stringValue($payload['timer_kind'] ?? null) === 'condition_timeout';
     }
 
-    private static function isPureTimerEvent(WorkflowHistoryEvent $event): bool
+    /**
+     * @param array<string, mixed> $payload
+     */
+    private static function isPureTimerEvent(WorkflowHistoryEvent $event, array $payload): bool
     {
         return in_array($event->event_type, [
             HistoryEventType::TimerScheduled,
             HistoryEventType::TimerFired,
             HistoryEventType::TimerCancelled,
         ], true)
-            && ! self::isInternalTimeoutTimerKind($event->payload['timer_kind'] ?? null);
+            && ! self::isInternalTimeoutTimerKind($payload['timer_kind'] ?? null);
     }
 
-    private static function isSignalWaitTimerEvent(WorkflowHistoryEvent $event): bool
+    /**
+     * @param array<string, mixed> $payload
+     */
+    private static function isSignalWaitTimerEvent(WorkflowHistoryEvent $event, array $payload): bool
     {
         return in_array($event->event_type, [
             HistoryEventType::TimerScheduled,
             HistoryEventType::TimerFired,
             HistoryEventType::TimerCancelled,
         ], true)
-            && self::stringValue($event->payload['timer_kind'] ?? null) === 'signal_timeout';
+            && self::stringValue($payload['timer_kind'] ?? null) === 'signal_timeout';
     }
 
     private static function isInternalTimeoutTimerKind(mixed $value): bool
@@ -565,23 +570,42 @@ final class WorkflowStepHistory
     {
         $eventTypes = [];
 
-        foreach (self::historyEventsForRun($run)->sortBy('sequence') as $event) {
-            if (! $event instanceof WorkflowHistoryEvent) {
-                continue;
-            }
-
-            if (! self::isWorkflowStepEvent($event)) {
-                continue;
-            }
-
-            if (self::intValue($event->payload['sequence'] ?? null) !== $sequence) {
-                continue;
-            }
-
-            $eventTypes[] = $event->event_type->value;
+        foreach (self::workflowStepEventsForSequence($run, $sequence) as $selected) {
+            $eventTypes[] = $selected['event']->event_type->value;
         }
 
         return array_values(array_unique($eventTypes));
+    }
+
+    /**
+     * @return list<array{event: WorkflowHistoryEvent, payload: array<string, mixed>, history_sequence: mixed}>
+     */
+    private static function workflowStepEventsForSequence(WorkflowRun $run, int $sequence): array
+    {
+        $selected = [];
+
+        foreach (self::historyEventsForRun($run) as $event) {
+            if (! $event instanceof WorkflowHistoryEvent || ! self::isWorkflowStepEvent($event)) {
+                continue;
+            }
+
+            $payload = $event->payload;
+
+            if (! is_array($payload) || self::intValue($payload['sequence'] ?? null) !== $sequence) {
+                continue;
+            }
+
+            $selected[] = [
+                'event' => $event,
+                'payload' => $payload,
+                'history_sequence' => $event->sequence,
+            ];
+        }
+
+        return (new Collection($selected))
+            ->sortBy('history_sequence', SORT_REGULAR)
+            ->values()
+            ->all();
     }
 
     /**
