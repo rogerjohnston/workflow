@@ -93,8 +93,9 @@ final class HistoryTimeline
         Collection $timers,
         Collection $failures,
     ): array {
+        $payload = $event->payload;
         /** @var array<string, mixed> $payload */
-        $payload = is_array($event->payload) ? $event->payload : [];
+        $payload = is_array($payload) ? $payload : [];
         $commandId = self::stringValue($event->workflow_command_id)
             ?? self::stringValue($payload['workflow_command_id'] ?? null);
         $taskId = self::stringValue($event->workflow_task_id);
@@ -130,6 +131,7 @@ final class HistoryTimeline
             'source_kind' => self::sourceKindFor($event),
             'source_id' => self::sourceIdFor(
                 $event,
+                $payload,
                 $commandMetadata,
                 $taskMetadata,
                 $activityMetadata,
@@ -747,7 +749,7 @@ final class HistoryTimeline
         ?string $activityId,
         ?array $failure,
     ): ?array {
-        $snapshot = ActivitySnapshot::fromEvent($event);
+        $snapshot = ActivitySnapshot::fromEvent($event, $payload);
 
         if (
             $snapshot === null
@@ -1021,6 +1023,7 @@ final class HistoryTimeline
      */
     private static function sourceIdFor(
         WorkflowHistoryEvent $event,
+        array $payload,
         ?array $command,
         ?array $task,
         ?array $activity,
@@ -1030,10 +1033,10 @@ final class HistoryTimeline
     ): ?string {
         return match (self::sourceKindFor($event)) {
             'workflow_command' => self::stringValue($command['id'] ?? null),
-            'workflow_service_call' => self::stringValue($event->payload['service_call_id'] ?? null),
-            'signal_wait' => self::stringValue($event->payload['signal_wait_id'] ?? null),
-            'condition_wait' => self::stringValue($event->payload['condition_wait_id'] ?? null),
-            'version_marker' => self::stringValue($event->payload['change_id'] ?? null),
+            'workflow_service_call' => self::stringValue($payload['service_call_id'] ?? null),
+            'signal_wait' => self::stringValue($payload['signal_wait_id'] ?? null),
+            'condition_wait' => self::stringValue($payload['condition_wait_id'] ?? null),
+            'version_marker' => self::stringValue($payload['change_id'] ?? null),
             'child_workflow_run' => self::stringValue($child['run_id'] ?? null)
                 ?? self::stringValue($child['instance_id'] ?? null),
             'activity_execution' => self::stringValue($activity['id'] ?? null)
@@ -1043,7 +1046,7 @@ final class HistoryTimeline
                         : null
                 ),
             'workflow_failure' => self::stringValue($failure['id'] ?? null)
-                ?? self::stringValue($event->payload['failure_id'] ?? null),
+                ?? self::stringValue($payload['failure_id'] ?? null),
             'timer' => self::stringValue($timer['id'] ?? null),
             'workflow_run' => self::stringValue($event->workflow_run_id),
             default => self::stringValue($task['id'] ?? null),
