@@ -144,6 +144,59 @@ final class ProjectionPrefetchTest extends TestCase
         $this->assertSame(count($entries), $otherRows[0]->newQuery()->where('workflow_run_id', $otherRun->id)->count());
     }
 
+    #[DataProvider('projectors')]
+    public function testReprojectionDoesNotWriteSemanticallyEqualPrefetchedPayloads(
+        string $projector,
+        string $identity,
+    ): void {
+        $run = $this->seedRun('prefetch-json-noop');
+        $entries = $this->entries();
+        /** @var list<Model> $rows */
+        $rows = $projector::project($run, $entries);
+        $connection = $rows[0]->getConnection();
+        $table = $rows[0]->getTable();
+
+        foreach ($rows as $row) {
+            $connection->table($table)
+                ->where('id', $row->getKey())
+                ->update([
+                    'payload' => json_encode(self::reverseAssociativeKeys($row->payload), JSON_THROW_ON_ERROR),
+                    'updated_at' => now()
+                        ->subMinute(),
+                ]);
+        }
+
+        $freshRun = $run->fresh();
+        $connection->flushQueryLog();
+        $connection->enableQueryLog();
+
+        try {
+            $reprojected = $projector::project($freshRun, $entries);
+            $queries = $connection->getQueryLog();
+        } finally {
+            $connection->disableQueryLog();
+        }
+
+        $writes = array_filter($queries, static fn (array $query): bool => preg_match(
+            '/^(insert|update|delete)\b/i',
+            ltrim($query['query']),
+        ) === 1 && str_contains($query['query'], $table));
+        $this->assertCount(0, $writes, sprintf(
+            '%s emitted projection writes: %s',
+            $projector,
+            json_encode(array_column($writes, 'query'), JSON_THROW_ON_ERROR),
+        ));
+        $this->assertCount(count($entries), $reprojected);
+        $this->assertSame(
+            array_column($entries, 'id'),
+            array_map(static fn (Model $row): mixed => $row->getAttribute($identity), $reprojected),
+        );
+        $this->assertSame(
+            array_column($entries, 'status', 'id'),
+            array_column(array_map(static fn (Model $row): array => $row->payload, $reprojected), 'status', 'id'),
+        );
+    }
+
     /**
      * @return list<array<string, mixed>>
      */
@@ -171,6 +224,24 @@ final class ProjectionPrefetchTest extends TestCase
         ksort($attributes);
 
         return $attributes;
+    }
+
+    private static function reverseAssociativeKeys(mixed $value): mixed
+    {
+        if (! is_array($value)) {
+            return $value;
+        }
+
+        if (array_is_list($value)) {
+            return array_map(self::reverseAssociativeKeys(...), $value);
+        }
+
+        $reversed = [];
+        foreach (array_reverse($value, true) as $key => $item) {
+            $reversed[$key] = self::reverseAssociativeKeys($item);
+        }
+
+        return $reversed;
     }
 
     private function seedRun(string $id): WorkflowRun
