@@ -39,14 +39,15 @@ final class ActivityRowLockOrder
                 ->lockForUpdate()
                 ->find($snapshotAttemptId);
 
-        // Legacy leased executions can lack the attempt pointer and counter.
+        // Legacy leased executions can lack the pointer and retain the schema's
+        // default counter of one, or a counter explicitly initialized to zero.
         // Prelock the normalizer's fallback before execution, including any
         // existing row left by a previous normalization.
         if (
             $includeClosedAttempts
             && $snapshot instanceof ActivityExecution
             && $snapshot->status === ActivityStatus::Running
-            && $snapshot->attempt_count === 0
+            && in_array($snapshot->attempt_count, [0, 1], true)
             && $snapshotAttemptId === null
         ) {
             $fallback = ActivityAttempt::query()

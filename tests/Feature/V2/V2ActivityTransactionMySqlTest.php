@@ -7,6 +7,7 @@ namespace Tests\Feature\V2;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Queue;
 use Illuminate\Support\Str;
+use PHPUnit\Framework\Attributes\DataProvider;
 use RuntimeException;
 use Tests\Fixtures\V2\TestGreetingWorkflow;
 use Tests\Fixtures\V2\TestMySqlCountingActivity;
@@ -201,11 +202,14 @@ final class V2ActivityTransactionMySqlTest extends TestCase
         $this->assertSame(1, $this->historyCount($run->id, HistoryEventType::ActivityCompleted));
     }
 
-    public function testConcurrentLegacyWatchdogsNormalizeOneAttemptWithoutGapLockCycle(): void
-    {
+    #[DataProvider('legacyAttemptCounters')]
+    public function testConcurrentLegacyWatchdogsNormalizeOneAttemptWithoutGapLockCycle(
+        int $executionAttemptCount,
+    ): void {
         [, $run, $execution, $task] = $this->createPendingActivity();
         $task->forceFill([
             'status' => TaskStatus::Leased,
+            'attempt_count' => 0,
             'leased_at' => now()
                 ->subMinute(),
             'lease_expires_at' => now()
@@ -213,6 +217,8 @@ final class V2ActivityTransactionMySqlTest extends TestCase
         ])->save();
         $execution->forceFill([
             'status' => ActivityStatus::Running,
+            'attempt_count' => $executionAttemptCount,
+            'current_attempt_id' => null,
             'started_at' => now()
                 ->subMinute(),
         ])->save();
@@ -258,7 +264,17 @@ final class V2ActivityTransactionMySqlTest extends TestCase
         $this->assertSame(0, $result['value']['repaired']);
         $this->assertSame(1, ActivityAttempt::query()->where('activity_execution_id', $execution->id)->count());
         $this->assertSame(TaskStatus::Ready, $task->fresh()->status);
+        $this->assertSame(1, $task->fresh()->attempt_count);
         $this->assertSame(1, $execution->fresh()->attempt_count);
+    }
+
+    /**
+     * @return iterable<string, array{int}>
+     */
+    public static function legacyAttemptCounters(): iterable
+    {
+        yield 'execution and task counters are zero' => [0];
+        yield 'execution counter is one while task counter is zero' => [1];
     }
 
     public function testWatchdogActivityRecoveryUsesCanonicalLockOrder(): void
@@ -431,6 +447,16 @@ final class V2ActivityTransactionMySqlTest extends TestCase
      */
     private function forkWithLockBarrier(callable $operation, ?string $pauseTable = null): array
     {
+        $connection = DB::connection();
+
+        if ($connection->transactionLevel() !== 0) {
+            throw new RuntimeException(
+                'The contention worker cannot fork while the parent owns a database transaction.'
+            );
+        }
+
+        DB::disconnect($connection->getName());
+
         $sockets = stream_socket_pair(STREAM_PF_UNIX, STREAM_SOCK_STREAM, STREAM_IPPROTO_IP);
 
         if ($sockets === false) {

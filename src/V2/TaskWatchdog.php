@@ -314,15 +314,25 @@ final class TaskWatchdog
             || $task->task_type !== TaskType::Activity
             || $task->workflow_run_id !== $run->id
             || ($task->payload['activity_execution_id'] ?? null) !== $execution->id
-            || $task->attempt_count !== $execution->attempt_count
             || $rows['snapshot_attempt_id'] !== $execution->current_attempt_id
         ) {
             return [null, null];
         }
 
         $attempt = $rows['attempt'];
+        $legacyLease = $task->status === TaskStatus::Leased
+            && TaskRepairPolicy::leaseExpired($task)
+            && $execution->status === ActivityStatus::Running
+            && $execution->current_attempt_id === null
+            && in_array($execution->attempt_count, [0, 1], true)
+            && in_array($task->attempt_count, [0, 1], true)
+            && $task->attempt_count <= $execution->attempt_count;
 
-        if ($execution->attempt_count > 0 || $execution->current_attempt_id !== null) {
+        if (! $legacyLease && $task->attempt_count !== $execution->attempt_count) {
+            return [null, null];
+        }
+
+        if (! $legacyLease && ($execution->attempt_count > 0 || $execution->current_attempt_id !== null)) {
             if (
                 ! $attempt instanceof ActivityAttempt
                 || $attempt->activity_execution_id !== $execution->id
@@ -334,9 +344,6 @@ final class TaskWatchdog
                 return [null, null];
             }
         } else {
-            $legacyLease = $task->status === TaskStatus::Leased
-                && TaskRepairPolicy::leaseExpired($task)
-                && $execution->status === ActivityStatus::Running;
             $initialTask = $task->status === TaskStatus::Ready
                 && $execution->status === ActivityStatus::Pending
                 && $execution->started_at === null

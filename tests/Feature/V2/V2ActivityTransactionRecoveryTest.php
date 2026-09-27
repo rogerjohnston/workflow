@@ -334,8 +334,18 @@ final class V2ActivityTransactionRecoveryTest extends TestCase
         $this->assertSame(2, ActivityAttempt::query()->count());
     }
 
-    public function testWatchdogRecoversLegacyLeasedActivityWithoutCurrentAttempt(): void
+    public static function supportedLegacyAttemptCounts(): iterable
     {
+        yield 'zeroed counters' => [0, 0];
+        yield 'execution schema default with zeroed task' => [1, 0];
+        yield 'matching schema defaults' => [1, 1];
+    }
+
+    #[DataProvider('supportedLegacyAttemptCounts')]
+    public function testWatchdogRecoversSupportedLegacyLeasedActivityWithoutCurrentAttempt(
+        int $executionAttemptCount,
+        int $taskAttemptCount,
+    ): void {
         $task = $this->readyActivity();
         $execution = ActivityExecution::query()->findOrFail($task->payload['activity_execution_id']);
         $task->forceFill([
@@ -345,12 +355,13 @@ final class V2ActivityTransactionRecoveryTest extends TestCase
             'lease_owner' => 'legacy-worker',
             'lease_expires_at' => now()
                 ->subSecond(),
+            'attempt_count' => $taskAttemptCount,
         ])->save();
         $execution->forceFill([
             'status' => ActivityStatus::Running,
             'started_at' => now()
                 ->subMinute(),
-            'attempt_count' => 0,
+            'attempt_count' => $executionAttemptCount,
             'current_attempt_id' => null,
         ])->save();
 
@@ -368,6 +379,50 @@ final class V2ActivityTransactionRecoveryTest extends TestCase
         $this->assertSame(ActivityAttemptStatus::Expired, $attempt->status);
         $this->assertSame($task->id, $attempt->workflow_task_id);
         $this->assertSame('legacy-worker', $attempt->lease_owner);
+    }
+
+    public static function unsupportedLegacyAttemptCounts(): iterable
+    {
+        yield 'execution counter beyond first attempt' => [2, 0];
+        yield 'task counter ahead of zeroed execution' => [0, 1];
+    }
+
+    #[DataProvider('unsupportedLegacyAttemptCounts')]
+    public function testWatchdogRejectsMalformedLegacyAttemptCountersWithoutWriting(
+        int $executionAttemptCount,
+        int $taskAttemptCount,
+    ): void {
+        $task = $this->readyActivity();
+        $execution = ActivityExecution::query()->findOrFail($task->payload['activity_execution_id']);
+        $task->forceFill([
+            'status' => TaskStatus::Leased,
+            'leased_at' => now()
+                ->subMinute(),
+            'lease_owner' => 'malformed-legacy-worker',
+            'lease_expires_at' => now()
+                ->subSecond(),
+            'attempt_count' => $taskAttemptCount,
+        ])->save();
+        $execution->forceFill([
+            'status' => ActivityStatus::Running,
+            'started_at' => now()
+                ->subMinute(),
+            'attempt_count' => $executionAttemptCount,
+            'current_attempt_id' => null,
+        ])->save();
+        $taskBefore = $task->fresh()
+            ->getAttributes();
+        $executionBefore = $execution->fresh()
+            ->getAttributes();
+
+        $report = TaskWatchdog::runPass(runIds: [$task->workflow_run_id]);
+
+        $this->assertSame(1, $report['selected_existing_task_candidates']);
+        $this->assertSame(0, $report['repaired_existing_tasks']);
+        $this->assertSame([], $report['existing_task_failures']);
+        $this->assertSame($taskBefore, $task->fresh()->getAttributes());
+        $this->assertSame($executionBefore, $execution->fresh()->getAttributes());
+        $this->assertSame(0, ActivityAttempt::query()->count());
     }
 
     public function testLateOutcomeOnCancelledRunCancelsTheNewerCurrentAttempt(): void
