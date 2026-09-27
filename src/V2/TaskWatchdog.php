@@ -9,14 +9,18 @@ use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
 use Throwable;
 use Workflow\V2\Contracts\HistoryProjectionRole;
+use Workflow\V2\Enums\ActivityAttemptStatus;
+use Workflow\V2\Enums\ActivityStatus;
 use Workflow\V2\Enums\RunStatus;
 use Workflow\V2\Enums\TaskStatus;
 use Workflow\V2\Enums\TaskType;
+use Workflow\V2\Models\ActivityAttempt;
 use Workflow\V2\Models\ActivityExecution;
 use Workflow\V2\Models\WorkerCompatibilityHeartbeat;
 use Workflow\V2\Models\WorkflowRun;
 use Workflow\V2\Models\WorkflowRunSummary;
 use Workflow\V2\Models\WorkflowTask;
+use Workflow\V2\Support\ActivityRowLockOrder;
 use Workflow\V2\Support\ActivityTimeoutEnforcer;
 use Workflow\V2\Support\RequestedTaskScope;
 use Workflow\V2\Support\TaskCompatibility;
@@ -218,26 +222,32 @@ final class TaskWatchdog
     private static function recoverExistingTask(string $candidateId): array
     {
         try {
-            $task = DB::transaction(static function () use ($candidateId): ?WorkflowTask {
+            $connection = (new WorkflowTask())->getConnection();
+            $task = $connection->transaction(static function () use ($candidateId): ?WorkflowTask {
                 /** @var WorkflowTask|null $task */
-                $task = WorkflowTask::query()
-                    ->lockForUpdate()
-                    ->find($candidateId);
+                $snapshot = WorkflowTask::query()->find($candidateId);
 
-                if ($task === null) {
+                if ($snapshot?->task_type === TaskType::Activity) {
+                    [$task, $run] = self::lockActivityRecoveryRows($snapshot);
+                } else {
+                    $task = WorkflowTask::query()->lockForUpdate()->find($candidateId);
+                    $run = $task === null ? null : WorkflowRun::query()
+                        ->lockForUpdate()
+                        ->find($task->workflow_run_id);
+
+                    // A changed routing snapshot must be reconsidered on the next pass.
+                    if ($task?->task_type === TaskType::Activity) {
+                        return null;
+                    }
+                }
+
+                if ($task === null || $run === null) {
                     return null;
                 }
 
-                if (! TaskRepairPolicy::readyTaskNeedsRedispatch($task) && ! TaskRepairPolicy::leaseExpired(
-                    $task
-                )) {
+                if (! TaskRepairPolicy::readyTaskNeedsRedispatch($task) && ! TaskRepairPolicy::leaseExpired($task)) {
                     return null;
                 }
-
-                /** @var WorkflowRun $run */
-                $run = WorkflowRun::query()
-                    ->lockForUpdate()
-                    ->findOrFail($task->workflow_run_id);
 
                 TaskCompatibility::sync($task, $run);
 
@@ -272,6 +282,103 @@ final class TaskWatchdog
             'task' => $task,
             'error' => null,
         ];
+    }
+
+    /**
+     * Fence normalization to a prelocked attempt or the supported unclaimed
+     * legacy identity. Partial identities are left for explicit repair.
+     *
+     * @return array{WorkflowTask|null, WorkflowRun|null}
+     */
+    private static function lockActivityRecoveryRows(WorkflowTask $snapshot): array
+    {
+        $executionId = $snapshot->payload['activity_execution_id'] ?? null;
+
+        if (! is_string($executionId) || $executionId === '') {
+            return [null, null];
+        }
+
+        $rows = ActivityRowLockOrder::lockForExecution($executionId, includeClosedAttempts: true);
+        $execution = $rows['execution'];
+
+        if (! $execution instanceof ActivityExecution) {
+            return [null, null];
+        }
+
+        $run = WorkflowRun::query()->lockForUpdate()->find($execution->workflow_run_id);
+        $task = WorkflowTask::query()->lockForUpdate()->find($snapshot->id);
+
+        if (
+            ! $run instanceof WorkflowRun
+            || ! $task instanceof WorkflowTask
+            || $task->task_type !== TaskType::Activity
+            || $task->workflow_run_id !== $run->id
+            || ($task->payload['activity_execution_id'] ?? null) !== $execution->id
+            || $rows['snapshot_attempt_id'] !== $execution->current_attempt_id
+        ) {
+            return [null, null];
+        }
+
+        $attempt = $rows['attempt'];
+        $legacyLease = $task->status === TaskStatus::Leased
+            && TaskRepairPolicy::leaseExpired($task)
+            && $execution->status === ActivityStatus::Running
+            && $execution->current_attempt_id === null
+            && in_array($execution->attempt_count, [0, 1], true)
+            && in_array($task->attempt_count, [0, 1], true)
+            && $task->attempt_count <= $execution->attempt_count;
+
+        if (! $legacyLease && $task->attempt_count !== $execution->attempt_count) {
+            return [null, null];
+        }
+
+        if (! $legacyLease && ($execution->attempt_count > 0 || $execution->current_attempt_id !== null)) {
+            if (
+                ! $attempt instanceof ActivityAttempt
+                || $attempt->activity_execution_id !== $execution->id
+                || $attempt->workflow_run_id !== $run->id
+                || $attempt->attempt_number !== $execution->attempt_count
+                || (($task->status === TaskStatus::Leased || $execution->status === ActivityStatus::Running)
+                    && $attempt->workflow_task_id !== $task->id)
+            ) {
+                return [null, null];
+            }
+        } else {
+            $initialTask = $task->status === TaskStatus::Ready
+                && $execution->status === ActivityStatus::Pending
+                && $execution->started_at === null
+                && $execution->closed_at === null;
+
+            if (! $legacyLease && ! $initialTask) {
+                return [null, null];
+            }
+
+            if ($attempt instanceof ActivityAttempt && (
+                $attempt->activity_execution_id !== $execution->id
+                || $attempt->workflow_run_id !== $run->id
+                || $attempt->workflow_task_id !== $task->id
+                || $attempt->attempt_number !== 1
+                || ! in_array($attempt->status, [ActivityAttemptStatus::Running, ActivityAttemptStatus::Expired], true)
+            )) {
+                return [null, null];
+            }
+        }
+
+        if (! $run->status->isTerminal() && $task->status === TaskStatus::Ready) {
+            if ($execution->status === ActivityStatus::Running) {
+                if ($attempt?->status !== ActivityAttemptStatus::Expired) {
+                    return [null, null];
+                }
+            } elseif ($execution->status !== ActivityStatus::Pending || ($attempt !== null && ! in_array(
+                $attempt->status,
+                [ActivityAttemptStatus::Failed, ActivityAttemptStatus::Expired],
+                true
+            ))) {
+                return [null, null];
+            }
+        }
+
+        return [$task, $run];
     }
 
     /**

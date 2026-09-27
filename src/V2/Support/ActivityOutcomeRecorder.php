@@ -4,7 +4,7 @@ declare(strict_types=1);
 
 namespace Workflow\V2\Support;
 
-use Illuminate\Support\Facades\DB;
+use LogicException;
 use Throwable;
 use Workflow\Serializers\CodecRegistry;
 use Workflow\Serializers\Serializer;
@@ -41,7 +41,15 @@ final class ActivityOutcomeRecorder
         int $backoffSeconds,
         ?string $codec = null,
     ): array {
-        return DB::transaction(static function () use (
+        // A database rollback cannot undo an external payload write. Prepare
+        // lazily, after the ownership guards, and retain the exact bytes and
+        // reference for every persistence attempt in this call.
+        $preparedSuccessfulResult = null;
+        $preparedResultContext = null;
+
+        $connection = (new WorkflowTask())->getConnection();
+
+        return $connection->transaction(static function () use (
             $taskId,
             $attemptId,
             $attemptCount,
@@ -50,11 +58,11 @@ final class ActivityOutcomeRecorder
             $maxAttempts,
             $backoffSeconds,
             $codec,
+            &$preparedSuccessfulResult,
+            &$preparedResultContext,
         ): array {
             /** @var WorkflowTask|null $task */
-            $task = WorkflowTask::query()
-                ->lockForUpdate()
-                ->find($taskId);
+            $task = WorkflowTask::query()->find($taskId);
 
             if (! $task instanceof WorkflowTask) {
                 return self::ignored('task_not_found');
@@ -66,15 +74,58 @@ final class ActivityOutcomeRecorder
                 return self::ignored('activity_execution_missing');
             }
 
-            /** @var ActivityExecution $lockedExecution */
-            $lockedExecution = ActivityExecution::query()
-                ->lockForUpdate()
-                ->findOrFail($activityExecutionId);
+            $lockedRows = ActivityRowLockOrder::lockForOutcome($activityExecutionId, $attemptId);
+            $attempt = $lockedRows['attempt'];
+            $lockedExecution = $lockedRows['execution'];
+
+            if (! $lockedExecution instanceof ActivityExecution) {
+                return self::ignored('activity_execution_missing');
+            }
 
             /** @var WorkflowRun $run */
             $run = WorkflowRun::query()
                 ->lockForUpdate()
                 ->findOrFail($lockedExecution->workflow_run_id);
+
+            $currentAttempt = $lockedRows['current_attempt'];
+            $currentTaskId = $currentAttempt?->workflow_task_id;
+            $taskIds = array_unique(array_filter([$taskId, $currentTaskId]));
+            sort($taskIds, SORT_STRING);
+            $tasks = [];
+
+            foreach ($taskIds as $id) {
+                $tasks[$id] = WorkflowTask::query()->lockForUpdate()->find($id);
+            }
+
+            $task = $tasks[$taskId] ?? null;
+            $currentTask = $currentTaskId === null ? null : ($tasks[$currentTaskId] ?? null);
+
+            if (! $task instanceof WorkflowTask) {
+                return self::ignored('task_not_found');
+            }
+
+            if (
+                ! $attempt instanceof ActivityAttempt
+                || $attempt->workflow_task_id !== $task->id
+                || $attempt->activity_execution_id !== $lockedExecution->id
+                || $attempt->workflow_run_id !== $run->id
+                || $attempt->attempt_number !== $attemptCount
+                || ($task->payload['activity_execution_id'] ?? null) !== $lockedExecution->id
+                || $task->workflow_run_id !== $run->id
+                || $lockedRows['snapshot_attempt_id'] !== $lockedExecution->current_attempt_id
+                || ! $currentAttempt instanceof ActivityAttempt
+                || $currentAttempt->activity_execution_id !== $lockedExecution->id
+                || $currentAttempt->workflow_run_id !== $run->id
+                || $currentAttempt->attempt_number !== $lockedExecution->attempt_count
+                || $task->task_type !== TaskType::Activity
+                || ! $currentTask instanceof WorkflowTask
+                || $currentTask->task_type !== TaskType::Activity
+                || $currentTask->workflow_run_id !== $run->id
+                || ($currentTask->payload['activity_execution_id'] ?? null) !== $lockedExecution->id
+                || $currentTask->attempt_count !== $currentAttempt->attempt_number
+            ) {
+                return self::ignored('stale_attempt');
+            }
 
             if (in_array($run->status, [RunStatus::Cancelled, RunStatus::Terminated], true)) {
                 $reason = $run->status === RunStatus::Terminated
@@ -86,14 +137,14 @@ final class ActivityOutcomeRecorder
                     'closed_at' => $lockedExecution->closed_at ?? now(),
                 ])->save();
 
-                self::closeAttempt($attemptId, ActivityAttemptStatus::Cancelled);
+                self::closeAttempt($attempt, ActivityAttemptStatus::Cancelled);
 
                 $task->forceFill([
                     'status' => TaskStatus::Cancelled,
                     'lease_expires_at' => null,
                 ])->save();
 
-                ActivityCancellation::record($run, $lockedExecution, $task);
+                ActivityCancellation::record($run, $lockedExecution, $currentTask);
 
                 self::projectRun($run->fresh(['instance', 'tasks', 'activityExecutions', 'failures']));
 
@@ -107,8 +158,9 @@ final class ActivityOutcomeRecorder
                 || $task->attempt_count !== $attemptCount
                 || $lockedExecution->attempt_count !== $attemptCount
                 || $lockedExecution->current_attempt_id !== $attemptId
+                || $attempt->status !== ActivityAttemptStatus::Running
             ) {
-                self::closeAttemptIfStale($run, $attemptId);
+                self::closeAttemptIfStale($run, $attempt);
 
                 return self::ignored('stale_attempt');
             }
@@ -119,16 +171,25 @@ final class ActivityOutcomeRecorder
             $encodedSuccessfulResult = null;
 
             if ($throwable === null) {
-                $encodedSuccessfulResult = self::serializeWithCodec(
-                    $result,
-                    $codec,
-                    self::preferredPayloadCodec($lockedExecution, $runCodec),
-                );
-                $encodedSuccessfulResult['blob'] = ExternalPayloads::externalizeForNamespace(
-                    $encodedSuccessfulResult['blob'],
-                    $encodedSuccessfulResult['codec'],
-                    is_string($run->namespace) ? $run->namespace : null,
-                );
+                $payloadContext = [
+                    'codec' => self::preferredPayloadCodec($lockedExecution, $runCodec),
+                    'namespace' => is_string($run->namespace) ? $run->namespace : null,
+                ];
+
+                if ($preparedSuccessfulResult === null) {
+                    $prepared = self::serializeWithCodec($result, $codec, $payloadContext['codec']);
+                    $prepared['blob'] = ExternalPayloads::externalizeForNamespace(
+                        $prepared['blob'],
+                        $prepared['codec'],
+                        $payloadContext['namespace'],
+                    );
+                    $preparedSuccessfulResult = $prepared;
+                    $preparedResultContext = $payloadContext;
+                } elseif ($preparedResultContext !== $payloadContext) {
+                    throw new LogicException('Activity result storage context changed during transaction recovery.');
+                }
+
+                $encodedSuccessfulResult = $preparedSuccessfulResult;
 
                 StructuralLimits::logWarning(
                     StructuralLimits::warnApproachingPayloadSize($encodedSuccessfulResult['blob']),
@@ -166,7 +227,7 @@ final class ActivityOutcomeRecorder
                 ])->save();
 
                 self::closeAttempt(
-                    $attemptId,
+                    $attempt,
                     $throwable === null ? ActivityAttemptStatus::Completed : ActivityAttemptStatus::Failed,
                 );
 
@@ -180,10 +241,7 @@ final class ActivityOutcomeRecorder
                 return self::recorded(null);
             }
 
-            $parallelMetadataPath = ParallelChildGroup::metadataPathForSequence(
-                $run,
-                (int) $lockedExecution->sequence,
-            );
+            $parallelMetadataPath = ParallelChildGroup::metadataPathForSequence($run, (int) $lockedExecution->sequence);
             $parallelMetadata = ParallelChildGroup::payloadForPath($parallelMetadataPath);
             $resolutionEvent = null;
 
@@ -221,14 +279,14 @@ final class ActivityOutcomeRecorder
                     $attemptCount,
                 );
 
-                self::closeAttempt($attemptId, ActivityAttemptStatus::Completed);
+                self::closeAttempt($attempt, ActivityAttemptStatus::Completed);
             } elseif (self::shouldRetry($lockedExecution, $throwable, $attemptCount, $maxAttempts)) {
                 $exceptionPayload = self::failurePayload($throwable, $codec);
                 $historyExceptionPayload = self::publicFailurePayload($throwable, $exceptionPayload);
                 $retryAvailableAt = now()
                     ->addSeconds($backoffSeconds);
 
-                self::closeAttempt($attemptId, ActivityAttemptStatus::Failed);
+                self::closeAttempt($attempt, ActivityAttemptStatus::Failed);
 
                 $lockedExecution->forceFill([
                     'status' => ActivityStatus::Pending,
@@ -282,11 +340,7 @@ final class ActivityOutcomeRecorder
                     'message' => $exceptionPayload['message'] ?? $throwable->getMessage(),
                     'code' => $throwable->getCode(),
                     'exception' => $historyExceptionPayload,
-                    'activity' => self::publicActivitySnapshot(
-                        $throwable,
-                        $lockedExecution,
-                        $historyExceptionPayload,
-                    ),
+                    'activity' => self::publicActivitySnapshot($throwable, $lockedExecution, $historyExceptionPayload),
                 ], $parallelMetadata ?? []), $task);
 
                 self::projectRun($run->fresh(['instance', 'tasks', 'activityExecutions', 'failures']));
@@ -362,7 +416,7 @@ final class ActivityOutcomeRecorder
                     $failure->message,
                 );
 
-                self::closeAttempt($attemptId, ActivityAttemptStatus::Failed);
+                self::closeAttempt($attempt, ActivityAttemptStatus::Failed);
             }
 
             $task->forceFill([
@@ -376,11 +430,7 @@ final class ActivityOutcomeRecorder
 
             if (
                 $parallelMetadataPath !== []
-                && ! ParallelChildGroup::shouldWakeParentOnActivityClosure(
-                    $run,
-                    $parallelMetadataPath,
-                    $closedStatus,
-                )
+                && ! ParallelChildGroup::shouldWakeParentOnActivityClosure($run, $parallelMetadataPath, $closedStatus)
             ) {
                 self::projectRun($run->fresh(['instance', 'tasks', 'activityExecutions', 'failures']));
 
@@ -417,7 +467,7 @@ final class ActivityOutcomeRecorder
             self::projectRun($run->fresh(['instance', 'tasks', 'activityExecutions', 'failures']));
 
             return self::recorded($resumeTask);
-        });
+        }, 3);
     }
 
     /**
@@ -589,14 +639,9 @@ final class ActivityOutcomeRecorder
         }
     }
 
-    private static function closeAttempt(string $attemptId, ActivityAttemptStatus $status): void
+    private static function closeAttempt(ActivityAttempt $attempt, ActivityAttemptStatus $status): void
     {
-        /** @var ActivityAttempt|null $attempt */
-        $attempt = ActivityAttempt::query()
-            ->lockForUpdate()
-            ->find($attemptId);
-
-        if (! $attempt instanceof ActivityAttempt || $attempt->status !== ActivityAttemptStatus::Running) {
+        if ($attempt->status !== ActivityAttemptStatus::Running) {
             return;
         }
 
@@ -607,13 +652,13 @@ final class ActivityOutcomeRecorder
         ])->save();
     }
 
-    private static function closeAttemptIfStale(WorkflowRun $run, string $attemptId): void
+    private static function closeAttemptIfStale(WorkflowRun $run, ActivityAttempt $attempt): void
     {
         $status = in_array($run->status, [RunStatus::Cancelled, RunStatus::Terminated], true)
             ? ActivityAttemptStatus::Cancelled
             : ActivityAttemptStatus::Expired;
 
-        self::closeAttempt($attemptId, $status);
+        self::closeAttempt($attempt, $status);
     }
 
     private static function shouldRetry(
