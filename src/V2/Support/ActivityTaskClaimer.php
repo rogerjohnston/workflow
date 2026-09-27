@@ -4,7 +4,6 @@ declare(strict_types=1);
 
 namespace Workflow\V2\Support;
 
-use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Str;
 use Workflow\V2\Contracts\HistoryProjectionRole;
 use Workflow\V2\Enums\ActivityAttemptStatus;
@@ -45,11 +44,13 @@ final class ActivityTaskClaimer
         ?string $leaseOwner = null,
         bool $releaseFutureTasks = false,
     ): array {
-        return DB::transaction(static function () use ($taskId, $leaseOwner, $releaseFutureTasks): array {
+        $connection = (new WorkflowTask())->getConnection();
+
+        return $connection->transaction(static function () use ($taskId, $leaseOwner, $releaseFutureTasks): array {
             /** @var WorkflowTask|null $task */
-            $task = WorkflowTask::query()
-                ->lockForUpdate()
-                ->find($taskId);
+            // The initial task read only locates its activity. Authoritative
+            // checks happen again after attempt -> execution -> run -> task.
+            $task = WorkflowTask::query()->find($taskId);
 
             if ($task === null) {
                 return self::claimFailure('task_not_found');
@@ -66,7 +67,7 @@ final class ActivityTaskClaimer
             if ($task->available_at !== null && $task->available_at->isFuture()) {
                 return self::claimFailure(
                     'task_not_due',
-                    $releaseFutureTasks ? self::releaseDelaySeconds($task) : null,
+                    $releaseFutureTasks ? self::releaseDelaySeconds($task) : null
                 );
             }
 
@@ -77,9 +78,8 @@ final class ActivityTaskClaimer
             }
 
             /** @var ActivityExecution|null $execution */
-            $execution = ActivityExecution::query()
-                ->lockForUpdate()
-                ->find($activityExecutionId);
+            $lockedRows = ActivityRowLockOrder::lockForExecution($activityExecutionId);
+            $execution = $lockedRows['execution'];
 
             if (! $execution instanceof ActivityExecution) {
                 return self::claimFailure('activity_execution_not_found');
@@ -92,6 +92,53 @@ final class ActivityTaskClaimer
 
             if (! $run instanceof WorkflowRun) {
                 return self::claimFailure('workflow_run_missing');
+            }
+
+            $task = WorkflowTask::query()->lockForUpdate()->find($taskId);
+
+            if (! $task instanceof WorkflowTask) {
+                return self::claimFailure('task_not_found');
+            }
+
+            if ($task->task_type !== TaskType::Activity) {
+                return self::claimFailure('task_not_activity');
+            }
+
+            if ($task->status !== TaskStatus::Ready) {
+                return self::claimFailure('task_not_ready');
+            }
+
+            if ($task->available_at !== null && $task->available_at->isFuture()) {
+                return self::claimFailure(
+                    'task_not_due',
+                    $releaseFutureTasks ? self::releaseDelaySeconds($task) : null
+                );
+            }
+
+            if (
+                ($task->payload['activity_execution_id'] ?? null) !== $execution->id
+                || $task->workflow_run_id !== $run->id
+                || $run->status->isTerminal()
+                || ! in_array($execution->status, [ActivityStatus::Pending, ActivityStatus::Running], true)
+                || $task->attempt_count !== $execution->attempt_count
+            ) {
+                return self::claimFailure('task_not_claimable');
+            }
+
+            if ($execution->status === ActivityStatus::Running) {
+                $previousAttempt = $lockedRows['attempt'];
+
+                if (
+                    ! $previousAttempt instanceof ActivityAttempt
+                    || $lockedRows['snapshot_attempt_id'] !== $execution->current_attempt_id
+                    || $previousAttempt->status !== ActivityAttemptStatus::Expired
+                    || $previousAttempt->workflow_task_id !== $task->id
+                    || $previousAttempt->workflow_run_id !== $run->id
+                    || $previousAttempt->activity_execution_id !== $execution->id
+                    || $previousAttempt->attempt_number !== $execution->attempt_count
+                ) {
+                    return self::claimFailure('task_not_claimable');
+                }
             }
 
             TaskCompatibility::sync($task, $run);
@@ -178,7 +225,7 @@ final class ActivityTaskClaimer
             self::historyProjectionRole()->recordActivityStarted($run, $execution, $attempt, $task);
 
             return self::claimSuccess(new ActivityTaskClaim($task, $run, $execution, $attempt));
-        });
+        }, 3);
     }
 
     /**
